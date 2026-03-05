@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+from datetime import datetime, timezone
 from ipaddress import IPv4Address, IPv4Network, collapse_addresses
 from pathlib import Path
 
@@ -12,6 +13,14 @@ SRS_BASE_URL = (
     "https://raw.githubusercontent.com/"
     "you-oops-dev/ipranges-singbox/main/country"
 )
+
+DEFAULT_COUNTRIES = ["ru", "by", "kz", "uz", "kg", "tj", "tm", "am", "az"]
+DEFAULT_LEVELS: list[tuple[int, int]] = [
+    (13, 1),
+    (17, 2),
+    (20, 5),
+    (24, 20),
+]
 
 
 def decompile_srs(srs_path: Path) -> dict:
@@ -111,8 +120,8 @@ def classify_multilevel(
         processed = 0
         step = max(total_blocks // 10, 1)
 
-        print(f"  Уровень /{block_prefix} (порог {threshold:.0%}): "
-              f"{total_blocks} блоков...", file=sys.stderr, flush=True)
+        print(f"  /{block_prefix} ({threshold:.0%}): {total_blocks} блоков",
+              end="", file=sys.stderr, flush=True)
 
         ri = 0
         for region_start, region_end in undecided:
@@ -135,10 +144,8 @@ def classify_multilevel(
                     next_undecided.append((block_start, block_end))
 
                 processed += 1
-                if processed % step == 0:
-                    pct = processed * 100 // total_blocks
-                    print(f"    {pct}%", file=sys.stderr, flush=True)
 
+        print(" ✓", file=sys.stderr, flush=True)
         undecided = next_undecided
 
     # Конвертируем интервалы в CIDR
@@ -159,7 +166,6 @@ def classify_multilevel(
     return ru_nets, not_ru_nets
 
 
-CIS_COUNTRIES = ["ru", "by", "kz", "uz", "kg", "tj", "tm", "am", "az", "ge", "md"]
 
 
 def download_srs(cc: str, dest_dir: Path) -> Path | None:
@@ -174,9 +180,15 @@ def download_srs(cc: str, dest_dir: Path) -> Path | None:
         return None
 
 
-def load_ip_cidrs(country_codes: list[str]) -> list[str]:
-    """Скачивает .srs файлы стран и извлекает IP CIDR."""
+def load_ip_cidrs(
+    country_codes: list[str],
+) -> tuple[list[str], dict[str, int]]:
+    """Скачивает .srs файлы стран и извлекает IP CIDR.
+
+    Возвращает (все CIDR, словарь страна → кол-во префиксов).
+    """
     all_cidrs: list[str] = []
+    stats: dict[str, int] = {}
 
     with tempfile.TemporaryDirectory(prefix="ipranges-") as tmpdir:
         tmp_path = Path(tmpdir)
@@ -192,8 +204,76 @@ def load_ip_cidrs(country_codes: list[str]) -> list[str]:
                     print(f"  {cc.upper()}: {len(cidrs)} префиксов",
                           file=sys.stderr)
                     all_cidrs.extend(cidrs)
+                    stats[cc.upper()] = stats.get(cc.upper(), 0) + len(cidrs)
 
-    return all_cidrs
+    return all_cidrs, stats
+
+
+def generate_readme(
+    countries: list[str],
+    country_stats: dict[str, int],
+    levels: list[tuple[int, float]],
+    original_count: int,
+    original_ips: int,
+    not_ru_count: int,
+    ru_count: int,
+    foreign_lost_pct: float,
+    leaked_pct: float,
+) -> str:
+    """Генерирует содержимое README.md."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    levels_str = ", ".join(f"/{p}:{t:.0%}" for p, t in levels)
+
+    country_lines = "\n".join(
+        f"| {cc} | {country_stats.get(cc.upper(), 0):,} |"
+        for cc in countries
+    )
+
+    return f"""\
+# my-ip-prefixes
+
+sing-box rule-set с IP-префиксами, **не** принадлежащими странам СНГ.
+
+Обновлено: **{now}**
+
+## Параметры
+
+| Параметр | Значение |
+|----------|----------|
+| Уровни классификации | `{levels_str}` |
+| Исходных префиксов | {original_count:,} |
+| Исходных IP | {original_ips:,} |
+
+## Загруженные страны
+
+| Страна | Префиксов |
+|--------|-----------|
+{country_lines}
+
+## Результат
+
+| Метрика | Значение |
+|---------|----------|
+| Не-наших префиксов | **{not_ru_count:,}** |
+| Наших префиксов | {ru_count:,} |
+| Потеря (чужие IP в наших) | {foreign_lost_pct:.2f}% |
+| Утечка (наши IP в чужих) | {leaked_pct:.2f}% |
+
+## Использование в sing-box
+
+```json
+{{
+  "rule_set": [
+    {{
+      "tag": "not-cis",
+      "type": "remote",
+      "url": "https://raw.githubusercontent.com/andreeyka/my-ip-prefixes/main/not-cis.srs",
+      "format": "binary"
+    }}
+  ]
+}}
+```
+"""
 
 
 def main() -> None:
@@ -202,13 +282,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--countries", type=str,
-        default=",".join(CIS_COUNTRIES),
-        help=f"Коды стран через запятую (по умолчанию: {','.join(CIS_COUNTRIES)})"
+        default=",".join(DEFAULT_COUNTRIES),
+        help=f"Коды стран через запятую (по умолчанию: {','.join(DEFAULT_COUNTRIES)})"
     )
+    def_levels_str = ",".join(f"{p}:{t}" for p, t in DEFAULT_LEVELS)
     parser.add_argument(
         "--levels", type=str,
-        default="13:1,17:2,20:5,24:20",
-        help="Уровни в формате 'prefix:threshold%%,...' (по умолчанию 13:1,17:2,20:5,24:20)"
+        default=def_levels_str,
+        help=f"Уровни в формате 'prefix:threshold%%,...' (по умолчанию {def_levels_str})"
     )
     parser.add_argument(
         "--output", "-o", type=str, default=None,
@@ -227,18 +308,13 @@ def main() -> None:
         prefix_str, thresh_str = part.split(":")
         levels.append((int(prefix_str), int(thresh_str) / 100))
 
-    print(f"Страны: {', '.join(c.upper() for c in countries)}", file=sys.stderr)
-    print(f"Уровни: {', '.join(f'/{p} при {t:.0%}' for p, t in levels)}",
-          file=sys.stderr)
-    print(file=sys.stderr)
-    print("Загрузка данных...", file=sys.stderr, flush=True)
+    print(f"Загрузка: {', '.join(c.upper() for c in countries)}")
 
-    all_cidrs = load_ip_cidrs(countries)
+    all_cidrs, country_stats = load_ip_cidrs(countries)
     if not all_cidrs:
         print("Нет данных для обработки", file=sys.stderr)
         sys.exit(1)
 
-    # Дедупликация и подсчёт
     networks = list(collapse_addresses(sorted(
         [IPv4Network(c, strict=False) for c in all_cidrs],
         key=lambda n: int(n.network_address),
@@ -246,9 +322,9 @@ def main() -> None:
     original_cidrs = [str(n) for n in networks]
     original_ips = sum(n.num_addresses for n in networks)
 
-    print(f"Исходных: {len(original_cidrs)} префиксов ({original_ips:,} IP)",
+    print(f"Исходных: {len(original_cidrs)} префиксов ({original_ips:,} IP)")
+    print(f"Классификация ({', '.join(f'/{p}:{t:.0%}' for p, t in levels)}):",
           file=sys.stderr)
-    print(file=sys.stderr)
 
     ru_blocks, not_ru_blocks = classify_multilevel(original_cidrs, levels)
 
@@ -262,18 +338,24 @@ def main() -> None:
     leaked = max(0, original_ips - ru_ips)
     leaked_pct = leaked / original_ips * 100
 
-    print(file=sys.stderr)
-    print(f"Результат не-наши: {len(not_ru_blocks):>8,} префиксов "
-          f"({not_ru_ips:>14,} IP)", file=sys.stderr)
-    print(f"Результат наши:    {len(ru_blocks):>8,} префиксов "
-          f"({ru_ips:>14,} IP)", file=sys.stderr)
-    print(file=sys.stderr)
-    print(f"Потеря (чужие IP ошибочно в наших): "
-          f"{foreign_lost:>12,} ({foreign_lost_pct:.2f}%)", file=sys.stderr)
-    print(f"Утечка (наши IP в чужих):           "
-          f"{leaked:>12,} ({leaked_pct:.2f}%)", file=sys.stderr)
+    print(f"Результат: {len(not_ru_blocks)} не-наших, {len(ru_blocks)} наших префиксов")
+    print(f"Потеря: {foreign_lost_pct:.2f}%, Утечка: {leaked_pct:.2f}%")
 
-    # Сохранение результата
+    # Генерация README.md
+    readme = generate_readme(
+        countries=countries,
+        country_stats=country_stats,
+        levels=levels,
+        original_count=len(original_cidrs),
+        original_ips=original_ips,
+        not_ru_count=len(not_ru_blocks),
+        ru_count=len(ru_blocks),
+        foreign_lost_pct=foreign_lost_pct,
+        leaked_pct=leaked_pct,
+    )
+    Path("README.md").write_text(readme)
+    print("README.md обновлён")
+
     if args.output:
         output_path = Path(args.output)
         ruleset = {
@@ -283,7 +365,6 @@ def main() -> None:
             ],
         }
         output_path.write_text(json.dumps(ruleset, indent=2) + "\n")
-        print(f"\nJSON сохранён: {output_path}", file=sys.stderr)
 
         if args.compile:
             srs_path = output_path.with_suffix(".srs")
@@ -293,15 +374,13 @@ def main() -> None:
                 capture_output=True,
                 text=True,
             )
-            if result.returncode == 0:
-                print(f"SRS скомпилирован: {srs_path}", file=sys.stderr)
-            else:
+            if result.returncode != 0:
                 print(f"Ошибка компиляции: {result.stderr}", file=sys.stderr)
                 sys.exit(1)
-    else:
-        # Без --output выводим префиксы в stdout
-        for net in not_ru_blocks:
-            print(net)
+            output_path.unlink()
+            print(f"Сохранён: {srs_path}")
+        else:
+            print(f"Сохранён: {output_path}")
 
 
 if __name__ == "__main__":

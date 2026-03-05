@@ -16,10 +16,10 @@ SRS_BASE_URL = (
 
 DEFAULT_COUNTRIES = ["ru", "by", "kz", "uz", "kg", "tj", "tm", "am", "az"]
 DEFAULT_LEVELS: list[tuple[int, int]] = [
-    (13, 1),
-    (17, 2),
-    (20, 5),
-    (24, 20),
+    (16, 1),
+    (20, 2),
+    (23, 3),
+    (26, 8),
 ]
 
 

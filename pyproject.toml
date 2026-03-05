@@ -1,0 +1,6 @@
+[project]
+name = "my-ip-prefixes"
+version = "0.1.0"
+description = "Генерация sing-box rule-set с не-СНГ IP префиксами"
+requires-python = ">=3.13"
+dependencies = []

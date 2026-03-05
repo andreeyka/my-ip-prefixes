@@ -15,11 +15,34 @@ SRS_BASE_URL = (
 )
 
 DEFAULT_COUNTRIES = ["ru", "by", "kz", "uz", "kg", "tj", "tm", "am", "az"]
+RESERVED_NETWORKS = [
+    IPv4Network("0.0.0.0/8"),
+    IPv4Network("10.0.0.0/8"),
+    IPv4Network("100.64.0.0/10"),
+    IPv4Network("127.0.0.0/8"),
+    IPv4Network("169.254.0.0/16"),
+    IPv4Network("172.16.0.0/12"),
+    IPv4Network("192.0.0.0/24"),
+    IPv4Network("192.0.2.0/24"),
+    IPv4Network("192.168.0.0/16"),
+    IPv4Network("198.18.0.0/15"),
+    IPv4Network("198.51.100.0/24"),
+    IPv4Network("203.0.113.0/24"),
+    IPv4Network("224.0.0.0/3"),
+]
 DEFAULT_LEVELS: list[tuple[int, int]] = [
-    (16, 1),
-    (20, 2),
-    (23, 3),
-    (26, 8),
+    (19, 1),
+    (22, 2),
+    (25, 3),
+    (28, 8),
+]
+REFERENCE_LEVELS: list[list[tuple[int, int]]] = [
+    [(16, 1), (20, 2), (23, 3), (26, 8)],
+    [(18, 1), (22, 2), (25, 3), (28, 8)],
+    [(19, 1), (22, 2), (25, 3), (28, 8)],
+    [(20, 1), (23, 1), (26, 2), (29, 5)],
+    [(21, 1), (24, 1), (27, 2), (30, 5)],
+    [(22, 1), (25, 2), (28, 3), (30, 8)],
 ]
 
 
@@ -209,6 +232,31 @@ def load_ip_cidrs(
     return all_cidrs, stats
 
 
+def compute_reference_table(
+    original_cidrs: list[str],
+    original_ips: int,
+) -> str:
+    """Рассчитывает справочную таблицу для разных конфигураций уровней."""
+    reserved_ips = sum(n.num_addresses for n in RESERVED_NETWORKS)
+    exact_not_ru_ips = 2**32 - original_ips - reserved_ips
+    rows: list[str] = []
+
+    for ref_levels in REFERENCE_LEVELS:
+        levels_float = [(p, t / 100) for p, t in ref_levels]
+        _, not_ru = classify_multilevel(original_cidrs, levels_float)
+        not_ru = [
+            n for n in not_ru
+            if not any(n.overlaps(r) for r in RESERVED_NETWORKS)
+        ]
+        not_ru_ips = sum(n.num_addresses for n in not_ru)
+        foreign_lost = max(0, exact_not_ru_ips - not_ru_ips)
+        loss_pct = foreign_lost / exact_not_ru_ips * 100
+        label = ",".join(f"{p}:{t}" for p, t in ref_levels)
+        rows.append(f"| `{label}` | {len(not_ru):,} | {loss_pct:.2f}% |")
+
+    return "\n".join(rows)
+
+
 def generate_readme(
     countries: list[str],
     country_stats: dict[str, int],
@@ -219,6 +267,7 @@ def generate_readme(
     ru_count: int,
     foreign_lost_pct: float,
     leaked_pct: float,
+    reference_table: str,
 ) -> str:
     """Генерирует содержимое README.md."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -233,6 +282,8 @@ def generate_readme(
 # my-ip-prefixes
 
 sing-box rule-set с IP-префиксами, **не** принадлежащими странам СНГ.
+
+Скачать: [https://raw.githubusercontent.com/andreeyka/my-ip-prefixes/main/not-cis.srs](https://raw.githubusercontent.com/andreeyka/my-ip-prefixes/main/not-cis.srs)
 
 Обновлено: **{now}**
 
@@ -259,10 +310,6 @@ sing-box rule-set с IP-префиксами, **не** принадлежащи�
 | Потеря (чужие IP в наших) | {foreign_lost_pct:.2f}% |
 | Утечка (наши IP в чужих) | {leaked_pct:.2f}% |
 
-## Скачать
-
-[not-cis.srs](https://raw.githubusercontent.com/andreeyka/my-ip-prefixes/main/not-cis.srs)
-
 ## Использование в sing-box
 
 ```json
@@ -277,6 +324,12 @@ sing-box rule-set с IP-префиксами, **не** принадлежащи�
   ]
 }}
 ```
+
+## Справочник: влияние уровней на точность
+
+| Уровни | Префиксов | Потеря |
+|--------|-----------|--------|
+{reference_table}
 """
 
 
@@ -332,9 +385,16 @@ def main() -> None:
 
     ru_blocks, not_ru_blocks = classify_multilevel(original_cidrs, levels)
 
+    # Исключаем приватные/зарезервированные сети
+    not_ru_blocks = [
+        n for n in not_ru_blocks
+        if not any(n.overlaps(r) for r in RESERVED_NETWORKS)
+    ]
+
+    reserved_ips = sum(n.num_addresses for n in RESERVED_NETWORKS)
     ru_ips = sum(n.num_addresses for n in ru_blocks)
     not_ru_ips = sum(n.num_addresses for n in not_ru_blocks)
-    exact_not_ru_ips = 2**32 - original_ips
+    exact_not_ru_ips = 2**32 - original_ips - reserved_ips
 
     foreign_lost = max(0, exact_not_ru_ips - not_ru_ips)
     foreign_lost_pct = foreign_lost / exact_not_ru_ips * 100
@@ -344,6 +404,10 @@ def main() -> None:
 
     print(f"Результат: {len(not_ru_blocks)} не-наших, {len(ru_blocks)} наших префиксов")
     print(f"Потеря: {foreign_lost_pct:.2f}%, Утечка: {leaked_pct:.2f}%")
+
+    # Справочная таблица
+    print("Расчёт справочной таблицы:", file=sys.stderr)
+    reference_table = compute_reference_table(original_cidrs, original_ips)
 
     # Генерация README.md
     readme = generate_readme(
@@ -356,6 +420,7 @@ def main() -> None:
         ru_count=len(ru_blocks),
         foreign_lost_pct=foreign_lost_pct,
         leaked_pct=leaked_pct,
+        reference_table=reference_table,
     )
     Path("README.md").write_text(readme)
     print("README.md обновлён")

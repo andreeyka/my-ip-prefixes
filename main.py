@@ -1,6 +1,7 @@
 import argparse
 import array
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,14 +37,15 @@ DEFAULT_LEVELS: list[tuple[int, int]] = [
     (25, 3),
     (28, 8),
 ]
-REFERENCE_LEVELS: list[list[tuple[int, int]]] = [
-    [(16, 1), (20, 2), (23, 3), (26, 8)],
-    [(18, 1), (22, 2), (25, 3), (28, 8)],
-    [(19, 1), (22, 2), (25, 3), (28, 8)],
-    [(20, 1), (23, 1), (26, 2), (29, 5)],
-    [(21, 1), (24, 1), (27, 2), (30, 5)],
-    [(22, 1), (25, 2), (28, 3), (30, 8)],
+VARIANTS: list[tuple[str, list[tuple[int, int]]]] = [
+    ("mini",   [(16, 1), (20, 2), (23, 3), (26, 8)]),
+    ("small",  [(18, 1), (22, 2), (25, 3), (28, 8)]),
+    ("medium", [(19, 1), (22, 2), (25, 3), (28, 8)]),
+    ("large",  [(20, 1), (23, 1), (26, 2), (29, 5)]),
+    ("xlarge", [(21, 1), (24, 1), (27, 2), (30, 5)]),
+    ("full",   [(22, 1), (25, 2), (28, 3), (30, 8)]),
 ]
+DEFAULT_VARIANT = "medium"
 
 
 def decompile_srs(srs_path: Path) -> dict:
@@ -232,18 +234,22 @@ def load_ip_cidrs(
     return all_cidrs, stats
 
 
-def compute_reference_table(
+def compute_all_variants(
     original_cidrs: list[str],
     original_ips: int,
-) -> str:
-    """Рассчитывает справочную таблицу для разных конфигураций уровней."""
+) -> list[dict]:
+    """Рассчитывает все варианты классификации.
+
+    Возвращает список dict с ключами:
+    name, levels, not_ru_nets, ru_nets, prefix_count, loss_pct, foreign_lost.
+    """
     reserved_ips = sum(n.num_addresses for n in RESERVED_NETWORKS)
     exact_not_ru_ips = 2**32 - original_ips - reserved_ips
-    rows: list[str] = []
+    results: list[dict] = []
 
-    for ref_levels in REFERENCE_LEVELS:
+    for name, ref_levels in VARIANTS:
         levels_float = [(p, t / 100) for p, t in ref_levels]
-        _, not_ru = classify_multilevel(original_cidrs, levels_float)
+        ru_nets, not_ru = classify_multilevel(original_cidrs, levels_float)
         not_ru = [
             n for n in not_ru
             if not any(n.overlaps(r) for r in RESERVED_NETWORKS)
@@ -251,9 +257,28 @@ def compute_reference_table(
         not_ru_ips = sum(n.num_addresses for n in not_ru)
         foreign_lost = max(0, exact_not_ru_ips - not_ru_ips)
         loss_pct = foreign_lost / exact_not_ru_ips * 100
-        label = ",".join(f"{p}:{t}" for p, t in ref_levels)
-        rows.append(f"| `{label}` | {len(not_ru):,} | {loss_pct:.2f}% |")
+        results.append({
+            "name": name,
+            "levels": ref_levels,
+            "not_ru_nets": not_ru,
+            "ru_nets": ru_nets,
+            "prefix_count": len(not_ru),
+            "loss_pct": loss_pct,
+            "foreign_lost": foreign_lost,
+        })
 
+    return results
+
+
+def format_reference_table(variants: list[dict]) -> str:
+    """Форматирует справочную таблицу для README."""
+    rows: list[str] = []
+    for v in variants:
+        label = ",".join(f"{p}:{t}" for p, t in v["levels"])
+        rows.append(
+            f"| `{v['name']}` | `{label}` | {v['prefix_count']:,} "
+            f"| {v['loss_pct']:.2f}% | {v['foreign_lost']:,} |"
+        )
     return "\n".join(rows)
 
 
@@ -325,11 +350,13 @@ sing-box rule-set с IP-префиксами, **не** принадлежащи�
 }}
 ```
 
-## Справочник: влияние уровней на точность
+## Варианты
 
-| Уровни | Префиксов | Потеря |
-|--------|-----------|--------|
+| Файл | Уровни | Префиксов | Потеря | Потеряно IP |
+|------|--------|-----------|--------|-------------|
 {reference_table}
+
+`not-cis.srs` — копия `not-cis-medium.srs`.
 """
 
 
@@ -350,7 +377,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output", "-o", type=str, default=None,
-        help="Путь для сохранения не-наших префиксов в JSON (sing-box rule-set формат)"
+        help="Директория для сохранения файлов (генерируются все варианты)"
     )
     parser.add_argument(
         "--compile", "-c", action="store_true",
@@ -383,31 +410,19 @@ def main() -> None:
     print(f"Классификация ({', '.join(f'/{p}:{t:.0%}' for p, t in levels)}):",
           file=sys.stderr)
 
-    ru_blocks, not_ru_blocks = classify_multilevel(original_cidrs, levels)
+    # Расчёт всех вариантов
+    print("Расчёт вариантов:", file=sys.stderr)
+    variants = compute_all_variants(original_cidrs, original_ips)
 
-    # Исключаем приватные/зарезервированные сети
-    not_ru_blocks = [
-        n for n in not_ru_blocks
-        if not any(n.overlaps(r) for r in RESERVED_NETWORKS)
-    ]
-
-    reserved_ips = sum(n.num_addresses for n in RESERVED_NETWORKS)
-    ru_ips = sum(n.num_addresses for n in ru_blocks)
-    not_ru_ips = sum(n.num_addresses for n in not_ru_blocks)
-    exact_not_ru_ips = 2**32 - original_ips - reserved_ips
-
-    foreign_lost = max(0, exact_not_ru_ips - not_ru_ips)
-    foreign_lost_pct = foreign_lost / exact_not_ru_ips * 100
-
+    default = next(v for v in variants if v["name"] == DEFAULT_VARIANT)
+    ru_ips = sum(n.num_addresses for n in default["ru_nets"])
     leaked = max(0, original_ips - ru_ips)
     leaked_pct = leaked / original_ips * 100
 
-    print(f"Результат: {len(not_ru_blocks)} не-наших, {len(ru_blocks)} наших префиксов")
-    print(f"Потеря: {foreign_lost_pct:.2f}%, Утечка: {leaked_pct:.2f}%")
+    print(f"Результат ({DEFAULT_VARIANT}): {default['prefix_count']} не-наших префиксов")
+    print(f"Потеря: {default['loss_pct']:.2f}%, Утечка: {leaked_pct:.2f}%")
 
-    # Справочная таблица
-    print("Расчёт справочной таблицы:", file=sys.stderr)
-    reference_table = compute_reference_table(original_cidrs, original_ips)
+    reference_table = format_reference_table(variants)
 
     # Генерация README.md
     readme = generate_readme(
@@ -416,9 +431,9 @@ def main() -> None:
         levels=levels,
         original_count=len(original_cidrs),
         original_ips=original_ips,
-        not_ru_count=len(not_ru_blocks),
-        ru_count=len(ru_blocks),
-        foreign_lost_pct=foreign_lost_pct,
+        not_ru_count=default["prefix_count"],
+        ru_count=len(default["ru_nets"]),
+        foreign_lost_pct=default["loss_pct"],
         leaked_pct=leaked_pct,
         reference_table=reference_table,
     )
@@ -426,30 +441,42 @@ def main() -> None:
     print("README.md обновлён")
 
     if args.output:
-        output_path = Path(args.output)
-        ruleset = {
-            "version": 1,
-            "rules": [
-                {"ip_cidr": [str(n) for n in not_ru_blocks]}
-            ],
-        }
-        output_path.write_text(json.dumps(ruleset, indent=2) + "\n")
+        output_dir = Path(args.output)
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        if args.compile:
-            srs_path = output_path.with_suffix(".srs")
-            result = subprocess.run(
-                ["sing-box", "rule-set", "compile",
-                 "--output", str(srs_path), str(output_path)],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                print(f"Ошибка компиляции: {result.stderr}", file=sys.stderr)
-                sys.exit(1)
-            output_path.unlink()
-            print(f"Сохранён: {srs_path}")
-        else:
-            print(f"Сохранён: {output_path}")
+        for v in variants:
+            json_path = output_dir / f"not-cis-{v['name']}.json"
+            ruleset = {
+                "version": 1,
+                "rules": [
+                    {"ip_cidr": [str(n) for n in v["not_ru_nets"]]}
+                ],
+            }
+            json_path.write_text(json.dumps(ruleset, indent=2) + "\n")
+
+            if args.compile:
+                srs_path = json_path.with_suffix(".srs")
+                result = subprocess.run(
+                    ["sing-box", "rule-set", "compile",
+                     "--output", str(srs_path), str(json_path)],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    print(f"Ошибка компиляции {v['name']}: {result.stderr}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                json_path.unlink()
+                print(f"Сохранён: {srs_path}")
+            else:
+                print(f"Сохранён: {json_path}")
+
+        # Копия medium → not-cis
+        default_src = output_dir / f"not-cis-{DEFAULT_VARIANT}"
+        default_dst = output_dir / "not-cis"
+        ext = ".srs" if args.compile else ".json"
+        shutil.copy2(str(default_src) + ext, str(default_dst) + ext)
+        print(f"Сохранён: {default_dst}{ext} (копия {DEFAULT_VARIANT})")
 
 
 if __name__ == "__main__":

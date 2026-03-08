@@ -14,8 +14,13 @@ SRS_BASE_URL = (
     "https://raw.githubusercontent.com/"
     "you-oops-dev/ipranges-singbox/main/country"
 )
+SRS_PROVIDERS_BASE_URL = (
+    "https://raw.githubusercontent.com/"
+    "you-oops-dev/ipranges-singbox/main"
+)
 
 DEFAULT_COUNTRIES = ["ru", "by", "kz", "uz", "kg", "tj", "tm", "am", "az"]
+DEFAULT_EXCLUDE = ["google-all", "cloudflare"]
 RESERVED_NETWORKS = [
     IPv4Network("0.0.0.0/8"),
     IPv4Network("10.0.0.0/8"),
@@ -234,6 +239,100 @@ def load_ip_cidrs(
     return all_cidrs, stats
 
 
+def download_provider_srs(name: str, dest_dir: Path) -> Path | None:
+    """Скачивает .srs файл провайдера из корня репо."""
+    url = f"{SRS_PROVIDERS_BASE_URL}/{name}/{name}.srs"
+    dest = dest_dir / f"{name}.srs"
+    try:
+        urllib.request.urlretrieve(url, dest)
+        return dest
+    except urllib.error.URLError as e:
+        print(f"  {name}: ошибка загрузки — {e}", file=sys.stderr)
+        return None
+
+
+def load_exclude_cidrs(names: list[str]) -> list[str]:
+    """Скачивает .srs файлы провайдеров/категорий для исключения из CIS.
+
+    Файлы берутся из корня репо: {name}/{name}.srs
+    Возвращает список CIDR для вычитания из CIS-пространства.
+    """
+    all_cidrs: list[str] = []
+
+    with tempfile.TemporaryDirectory(prefix="ipranges-excl-") as tmpdir:
+        tmp_path = Path(tmpdir)
+        for name in names:
+            srs_path = download_provider_srs(name, tmp_path)
+            if srs_path is None:
+                continue
+
+            data = decompile_srs(srs_path)
+            for rule in data.get("rules", []):
+                cidrs = rule.get("ip_cidr", [])
+                if cidrs:
+                    print(f"  Исключение {name}: {len(cidrs)} префиксов",
+                          file=sys.stderr)
+                    all_cidrs.extend(cidrs)
+
+    return all_cidrs
+
+
+def subtract_cidrs(
+    base_cidrs: list[str],
+    exclude_cidrs: list[str],
+) -> list[str]:
+    """Вычитает exclude_cidrs из base_cidrs через интервалы [start, end).
+
+    Возвращает список CIDR base без пересечений с exclude.
+    """
+    if not exclude_cidrs:
+        return base_cidrs
+
+    # Строим отсортированные интервалы для исключений
+    exc_nets = list(collapse_addresses(
+        IPv4Network(c, strict=False) for c in exclude_cidrs if "." in c
+    ))
+    exc_intervals = sorted(
+        (int(n.network_address), int(n.network_address) + n.num_addresses)
+        for n in exc_nets
+    )
+
+    # Для каждого базового CIDR вычитаем исключения через интервальную арифметику
+    result_nets: list[IPv4Network] = []
+    for cidr in base_cidrs:
+        if ":" in cidr:
+            continue
+        net = IPv4Network(cidr, strict=False)
+        remaining = [(int(net.network_address), int(net.network_address) + net.num_addresses)]
+
+        for exc_start, exc_end in exc_intervals:
+            if not remaining:
+                break
+            # Пропускаем исключения, которые полностью за пределами текущего диапазона
+            if exc_end <= remaining[0][0]:
+                continue
+            if exc_start >= remaining[-1][1]:
+                break
+            next_remaining: list[tuple[int, int]] = []
+            for r_start, r_end in remaining:
+                if exc_end <= r_start or exc_start >= r_end:
+                    next_remaining.append((r_start, r_end))
+                else:
+                    if r_start < exc_start:
+                        next_remaining.append((r_start, exc_start))
+                    if exc_end < r_end:
+                        next_remaining.append((exc_end, r_end))
+            remaining = next_remaining
+
+        for s, e in remaining:
+            result_nets.extend(range_to_cidrs(s, e))
+
+    result_nets = list(collapse_addresses(sorted(
+        result_nets, key=lambda n: int(n.network_address)
+    )))
+    return [str(n) for n in result_nets]
+
+
 def compute_all_variants(
     original_cidrs: list[str],
     original_ips: int,
@@ -383,9 +482,14 @@ def main() -> None:
         "--compile", "-c", action="store_true",
         help="Скомпилировать результат в .srs (требует --output)"
     )
+    parser.add_argument(
+        "--exclude", type=str, default=",".join(DEFAULT_EXCLUDE),
+        help=f"Имена секций для исключения из CIS (через запятую, по умолчанию: {','.join(DEFAULT_EXCLUDE)})"
+    )
     args = parser.parse_args()
 
     countries = [c.strip().lower() for c in args.countries.split(",")]
+    exclude_names = [n.strip().lower() for n in args.exclude.split(",") if args.exclude.strip()]
 
     levels: list[tuple[int, float]] = []
     for part in args.levels.split(","):
@@ -398,6 +502,14 @@ def main() -> None:
     if not all_cidrs:
         print("Нет данных для обработки", file=sys.stderr)
         sys.exit(1)
+
+    if exclude_names:
+        print(f"Загрузка исключений: {', '.join(exclude_names)}", file=sys.stderr)
+        exclude_cidrs = load_exclude_cidrs(exclude_names)
+        if exclude_cidrs:
+            before = len(all_cidrs)
+            all_cidrs = subtract_cidrs(all_cidrs, exclude_cidrs)
+            print(f"После вычитания: {before} → {len(all_cidrs)} префиксов", file=sys.stderr)
 
     networks = list(collapse_addresses(sorted(
         [IPv4Network(c, strict=False) for c in all_cidrs],

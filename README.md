@@ -4,7 +4,7 @@ sing-box rule-set с IP-префиксами, **не** принадлежащи�
 
 Скачать: [https://raw.githubusercontent.com/andreeyka/my-ip-prefixes/main/not-cis.srs](https://raw.githubusercontent.com/andreeyka/my-ip-prefixes/main/not-cis.srs)
 
-Обновлено: **2026-09-13 18:31 UTC**
+Обновлено: **2026-09-13 22:03 UTC**
 
 ## Параметры
 
@@ -35,7 +35,7 @@ IP этих провайдеров принудительно считаются
 
 | Провайдер | Префиксов в источнике |
 |-----------|-----------------------|
-| `google-all` | 17,984 |
+| `google-all` | 17,985 |
 | `cloudflare` | 15 |
 
 ## Результат

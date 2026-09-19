@@ -4,7 +4,7 @@ sing-box rule-set с IP-префиксами, **не** принадлежащи�
 
 Скачать: [https://raw.githubusercontent.com/andreeyka/my-ip-prefixes/main/not-cis.srs](https://raw.githubusercontent.com/andreeyka/my-ip-prefixes/main/not-cis.srs)
 
-Обновлено: **2026-09-19 08:29 UTC**
+Обновлено: **2026-09-19 15:15 UTC**
 
 ## Параметры
 
